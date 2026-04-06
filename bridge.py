@@ -36,10 +36,36 @@ mongo_client = None
 db = None
 collection = None
 mqtt_connected = False
+current_sensor_data = None  # Store latest sensor data in memory
 
 # ---------- FLASK APP ----------
 app = Flask(__name__)
 CORS(app)
+
+@app.route('/api/current', methods=['GET'])
+def get_current():
+    """Fetch the latest sensor data in memory (real-time from MQTT)"""
+    global current_sensor_data
+    try:
+        if current_sensor_data is None:
+            # If no live data yet, return from database
+            if collection is None:
+                return jsonify({'error': 'No data available'}), 500
+            record = collection.find_one(sort=[('created_at', -1)])
+            if record is None:
+                return jsonify({'error': 'No data in database'}), 500
+            del record['_id']
+            if 'created_at' in record and hasattr(record['created_at'], 'isoformat'):
+                record['created_at'] = record['created_at'].isoformat()
+            logger.info("[API] Returned current data from database")
+            return jsonify([record]), 200
+        
+        # Return the latest data we received from MQTT
+        logger.info("[API] Returned current data from live MQTT stream")
+        return jsonify([current_sensor_data]), 200
+    except Exception as e:
+        logger.error(f"[API] Error fetching current data: {e}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/history', methods=['GET'])
 def get_history():
@@ -147,12 +173,18 @@ def on_mqtt_message(client, userdata, msg):
 
 def handle_sensor_data(data):
     """Process incoming sensor data and save to MongoDB"""
+    global current_sensor_data
     try:
         # Add timestamp
-        data['created_at'] = datetime.utcnow()
+        data['created_at'] = datetime.utcnow().isoformat()
+        
+        # Store in memory for /api/current endpoint (live data)
+        current_sensor_data = data
+        logger.info(f"[LIVE] Current sensor data updated: water_dist={data.get('water_dist', 'N/A')}")
         
         # Save to MongoDB
         if collection is not None:
+            data['created_at'] = datetime.utcnow()  # Keep as datetime for MongoDB
             result = collection.insert_one(data)
             logger.info(f"[DB] Sensor data saved (ID: {result.inserted_id})")
         else:
