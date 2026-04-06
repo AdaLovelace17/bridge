@@ -175,14 +175,15 @@ def handle_sensor_data(data):
     """Process incoming sensor data and save to MongoDB"""
     global current_sensor_data
     try:
-        # Add timestamp
-        data['created_at'] = datetime.utcnow().isoformat()
+        # Create a copy for in-memory storage (with ISO timestamp for JSON)
+        live_data = data.copy()
+        live_data['created_at'] = datetime.utcnow().isoformat()
         
         # Store in memory for /api/current endpoint (live data)
-        current_sensor_data = data
-        logger.info(f"[LIVE] Current sensor data updated: water_dist={data.get('water_dist', 'N/A')}")
+        current_sensor_data = live_data
+        logger.info(f"[LIVE] Current sensor data updated: water_dist={live_data.get('water_dist', 'N/A')}")
         
-        # Save to MongoDB
+        # Save to MongoDB (with datetime timestamp)
         if collection is not None:
             data['created_at'] = datetime.utcnow()  # Keep as datetime for MongoDB
             result = collection.insert_one(data)
