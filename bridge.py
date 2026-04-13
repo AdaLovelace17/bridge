@@ -61,7 +61,7 @@ ALERT_MAP = {
 # ─────────────────────────────────────────────
 alert_cooldowns = {}
 
-def can_alert(farm_id, alert_type, minutes=10):
+def can_alert(farm_id, alert_type, minutes=1):
     key = f'{farm_id}_{alert_type}'
     last = alert_cooldowns.get(key)
     now = datetime.utcnow()
