@@ -42,7 +42,7 @@ VAPID_EMAIL   = os.getenv('VAPID_EMAIL', 'admin@henhouse.com')
 FLASK_URL = os.getenv('FLASK_URL', '')
 
 # ─────────────────────────────────────────────
-# Alert map: type → (severity, Arabic/English title, message)
+# Alert map
 # ─────────────────────────────────────────────
 ALERT_MAP = {
     'fire':       ('critical', '🔥 حريق / Fire Detected',          'Flame sensor triggered — immediate action required'),
@@ -57,11 +57,24 @@ ALERT_MAP = {
 }
 
 # ─────────────────────────────────────────────
-# Cooldown tracker (in-memory)
+# Cooldown per alert type (minutes)
 # ─────────────────────────────────────────────
+ALERT_COOLDOWNS = {
+    'fire':       2,
+    'gas':        2,
+    'high_temp':  5,
+    'low_temp':   5,
+    'high_hum':   5,
+    'low_tank':   10,
+    'low_trough': 10,
+    'low_food':   15,
+    'pump_block': 5,
+}
+
 alert_cooldowns = {}
 
-def can_alert(farm_id, alert_type, minutes=1):
+def can_alert(farm_id, alert_type):
+    minutes = ALERT_COOLDOWNS.get(alert_type, 10)
     key = f'{farm_id}_{alert_type}'
     last = alert_cooldowns.get(key)
     now = datetime.utcnow()
@@ -150,7 +163,6 @@ def send_whatsapp(to_number, message):
         log.error(f'WhatsApp error: {e}')
 
 def notify_user(farm_id, severity, title, body):
-    """Send web push and, for critical alerts, SMS/WhatsApp."""
     send_web_push_to_farm(farm_id, title, body)
     if severity == 'critical' and MONGO_OK:
         user = users_col.find_one({'farm_id': farm_id})
@@ -192,22 +204,23 @@ def handle_alert(payload: dict):
         if not can_alert(farm_id, alert_type):
             log.info(f'Alert {alert_type} for {farm_id} suppressed (cooldown)')
             return
-        from datetime import timedelta
+
+        minutes = ALERT_COOLDOWNS.get(alert_type, 10)
         existing = notifs_col.find_one({
-        'farm_id': farm_id,
-        'type': alert_type,
-        'timestamp': {'$gte': (datetime.utcnow() - timedelta(minutes=10)).isoformat() + 'Z'}
+            'farm_id': farm_id,
+            'type': alert_type,
+            'timestamp': {'$gte': (datetime.utcnow() - timedelta(minutes=minutes)).isoformat() + 'Z'}
         })
         if existing:
             log.info(f'Alert {alert_type} already in DB, skipping')
             return
-            
+
         info = ALERT_MAP.get(alert_type)
         if not info:
             log.warning(f'Unknown alert type: {alert_type}')
             severity = 'warning'
             title = f'⚠️ Alert: {alert_type}'
-            message = f'Alert received from device'
+            message = 'Alert received from device'
         else:
             severity, title, message = info
 
@@ -266,7 +279,6 @@ def on_message(client, userdata, msg):
 def connect_mqtt():
     global mqtt_client
     try:
-        import time
         c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1, client_id=f'henhouse_bridge_{int(time.time())}')
         c.username_pw_set(MQTT_USER, MQTT_PASS)
         c.on_connect    = on_connect
@@ -317,7 +329,7 @@ def watchdog():
 threading.Thread(target=watchdog, daemon=True).start()
 
 # ─────────────────────────────────────────────
-# Minimal Flask API (fallback for old HTML dashboard)
+# Minimal Flask API
 # ─────────────────────────────────────────────
 from flask import Flask, jsonify, request as flask_request
 from flask_cors import CORS
