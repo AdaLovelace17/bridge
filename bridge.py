@@ -258,7 +258,8 @@ def connect_mqtt():
     global mqtt_client
     try:
         import time
-        c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1, client_id=f'henhouse_bridge_{int(time.time())}')        c.username_pw_set(MQTT_USER, MQTT_PASS)
+        c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1, client_id=f'henhouse_bridge_{int(time.time())}')
+        c.username_pw_set(MQTT_USER, MQTT_PASS)
         c.on_connect    = on_connect
         c.on_disconnect = on_disconnect
         c.on_message    = on_message
