@@ -192,7 +192,16 @@ def handle_alert(payload: dict):
         if not can_alert(farm_id, alert_type):
             log.info(f'Alert {alert_type} for {farm_id} suppressed (cooldown)')
             return
-
+        from datetime import timedelta
+        existing = notifs_col.find_one({
+        'farm_id': farm_id,
+        'type': alert_type,
+        'timestamp': {'$gte': (datetime.utcnow() - timedelta(minutes=10)).isoformat() + 'Z'}
+        })
+        if existing:
+            log.info(f'Alert {alert_type} already in DB, skipping')
+            return
+            
         info = ALERT_MAP.get(alert_type)
         if not info:
             log.warning(f'Unknown alert type: {alert_type}')
