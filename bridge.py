@@ -1,330 +1,357 @@
-import paho.mqtt.client as mqtt
-from pymongo import MongoClient
-from datetime import datetime
+"""
+HenHouse Bridge — runs on Render.com
+Subscribes to MQTT, saves sensor data to MongoDB, enriches and stores alerts.
+"""
+import os
 import json
+import logging
 import threading
 import time
-import logging
-from flask import Flask, jsonify, request
-from flask_cors import CORS
-from bson.objectid import ObjectId
+from datetime import datetime, timedelta
 
-# ---------- LOGGING ----------
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+import paho.mqtt.client as mqtt
+from pymongo import MongoClient, DESCENDING
+import requests
 
-# ---------- CONFIGURATION ----------
-MQTT_BROKER = "w150161e.ala.eu-central-1.emqxsl.com"
-MQTT_PORT = 8883
-MQTT_USER = "HenHouse"
-MQTT_PASS = "Mouna1817"
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+log = logging.getLogger('bridge')
 
-TOPIC_SENSORS = "mouna/farm/sensors"
-TOPIC_COMMANDS = "mouna/farm/app_commands"
-TOPIC_ACTUATORS = "mouna/farm/arduino_actuators"
+# ─────────────────────────────────────────────
+# Config
+# ─────────────────────────────────────────────
+MONGO_URI = os.getenv('MONGO_URI', 'mongodb+srv://HenHouse_db_user:Mouna1817@cluster0.cgzyo5y.mongodb.net/')
+DB_NAME   = 'HenHouse_db'
 
-MONGO_URI = "mongodb+srv://HenHouse_db_user:Mouna1817@cluster0.cgzyo5y.mongodb.net/"
-MONGO_DB = "HenHouse_db"
-MONGO_COLLECTION = "sensors_log"
+MQTT_BROKER = os.getenv('MQTT_HOST', 'w150161e.ala.eu-central-1.emqxsl.com')
+MQTT_PORT   = int(os.getenv('MQTT_PORT', '8883'))
+MQTT_USER   = os.getenv('MQTT_USER', 'HenHouse')
+MQTT_PASS   = os.getenv('MQTT_PASS', 'Mouna1817')
 
-# ---------- GLOBAL STATE ----------
-mqtt_client = None
-mongo_client = None
+TOPIC_SENSORS  = 'mouna/farm/sensors'
+TOPIC_ALERTS   = 'henhouse/alerts'
+TOPIC_COMMANDS = 'mouna/farm/app_commands'
+
+TWILIO_SID   = os.getenv('TWILIO_SID', '')
+TWILIO_TOKEN = os.getenv('TWILIO_TOKEN', '')
+TWILIO_FROM  = os.getenv('TWILIO_FROM', '')
+
+VAPID_PRIVATE = os.getenv('VAPID_PRIVATE', '')
+VAPID_PUBLIC  = os.getenv('VAPID_PUBLIC', '')
+VAPID_EMAIL   = os.getenv('VAPID_EMAIL', 'admin@henhouse.com')
+
+FLASK_URL = os.getenv('FLASK_URL', '')
+
+# ─────────────────────────────────────────────
+# Alert map: type → (severity, Arabic/English title, message)
+# ─────────────────────────────────────────────
+ALERT_MAP = {
+    'fire':       ('critical', '🔥 حريق / Fire Detected',          'Flame sensor triggered — immediate action required'),
+    'gas':        ('critical', '☁️ غاز خطير / Dangerous Gas',      'Gas level critical — ventilate immediately'),
+    'high_temp':  ('critical', '🌡 حرارة خطيرة / Critical Temp',   'Temperature above maximum threshold'),
+    'low_temp':   ('warning',  '🌡 حرارة منخفضة / Low Temp',       'Temperature below minimum threshold'),
+    'high_hum':   ('warning',  '💧 رطوبة عالية / High Humidity',   'Humidity above safe level'),
+    'low_tank':   ('warning',  '💧 خزان منخفض / Low Tank',         'Main water tank below minimum'),
+    'low_trough': ('warning',  '💧 مشرب منخفض / Low Trough',       'Water trough below minimum'),
+    'low_food':   ('warning',  '🌾 غذاء منخفض / Low Food',         'Food level below minimum'),
+    'pump_block': ('warning',  '⚠️ انسداد / Pump Blockage',        'Pump running with no flow detected'),
+}
+
+# ─────────────────────────────────────────────
+# Cooldown tracker (in-memory)
+# ─────────────────────────────────────────────
+alert_cooldowns = {}
+
+def can_alert(farm_id, alert_type, minutes=10):
+    key = f'{farm_id}_{alert_type}'
+    last = alert_cooldowns.get(key)
+    now = datetime.utcnow()
+    if last and (now - last).total_seconds() < minutes * 60:
+        return False
+    alert_cooldowns[key] = now
+    return True
+
+# ─────────────────────────────────────────────
+# MongoDB
+# ─────────────────────────────────────────────
+mongo = None
 db = None
-collection = None
-mqtt_connected = False
-current_sensor_data = None  # Store latest sensor data in memory
+sensors_col = None
+notifs_col = None
+users_col = None
+MONGO_OK = False
 
-# ---------- FLASK APP ----------
-app = Flask(__name__)
-CORS(app)
-
-@app.route('/api/current', methods=['GET'])
-def get_current():
-    """Fetch the latest sensor data in memory (real-time from MQTT)"""
-    global current_sensor_data
+def connect_mongo():
+    global mongo, db, sensors_col, notifs_col, users_col, MONGO_OK
     try:
-        if current_sensor_data is None:
-            # If no live data yet, return from database
-            if collection is None:
-                return jsonify({'error': 'No data available'}), 500
-            record = collection.find_one(sort=[('created_at', -1)])
-            if record is None:
-                return jsonify({'error': 'No data in database'}), 500
-            del record['_id']
-            if 'created_at' in record and hasattr(record['created_at'], 'isoformat'):
-                record['created_at'] = record['created_at'].isoformat()
-            logger.info("[API] Returned current data from database")
-            return jsonify([record]), 200
-        
-        # Return the latest data we received from MQTT
-        logger.info("[API] Returned current data from live MQTT stream")
-        return jsonify([current_sensor_data]), 200
+        mongo = MongoClient(MONGO_URI, serverSelectionTimeoutMS=6000)
+        mongo.admin.command('ping')
+        db = mongo[DB_NAME]
+        sensors_col = db['sensors_log']
+        notifs_col  = db['notifications']
+        users_col   = db['users']
+        MONGO_OK = True
+        log.info('MongoDB connected')
     except Exception as e:
-        logger.error(f"[API] Error fetching current data: {e}")
-        return jsonify({'error': str(e)}), 500
+        log.error(f'MongoDB connection failed: {e}')
+        MONGO_OK = False
 
-@app.route('/api/history', methods=['GET'])
-def get_history():
-    """Fetch last 20 sensor records from MongoDB"""
+connect_mongo()
+
+# ─────────────────────────────────────────────
+# Web push
+# ─────────────────────────────────────────────
+def send_web_push_to_farm(farm_id, title, body):
+    if not VAPID_PRIVATE or not MONGO_OK:
+        return
     try:
-        if collection is None:
-            return jsonify({'error': 'Database not connected'}), 500
-        
-        # Get last 20 records sorted by created_at descending
-        records = list(collection.find().sort('created_at', -1).limit(20))
-        
-        # Remove MongoDB ObjectId and convert to JSON-serializable format
-        for record in records:
-            del record['_id']
-            if 'created_at' in record and hasattr(record['created_at'], 'isoformat'):
-                record['created_at'] = record['created_at'].isoformat()
-        
-        # Reverse to get ascending order (oldest first)
-        records.reverse()
-        logger.info(f"[API] Returned {len(records)} history records")
-        return jsonify(records), 200
+        from pywebpush import webpush, WebPushException
+        user = users_col.find_one({'farm_id': farm_id})
+        subs = (user or {}).get('push_subscriptions', [])
+        for sub in subs:
+            try:
+                webpush(
+                    subscription_info=sub,
+                    data=json.dumps({'title': title, 'body': body}),
+                    vapid_private_key=VAPID_PRIVATE,
+                    vapid_claims={'sub': f'mailto:{VAPID_EMAIL}'},
+                )
+            except Exception as e:
+                log.warning(f'Push failed for sub: {e}')
     except Exception as e:
-        logger.error(f"[API] Error fetching history: {e}")
-        return jsonify({'error': str(e)}), 500
+        log.error(f'send_web_push_to_farm error: {e}')
 
-# ---------- MONGODB CONNECTION ----------
-def connect_mongodb():
-    """Establish MongoDB connection with retry logic"""
-    global mongo_client, db, collection
-    retry_count = 0
-    max_retries = 5
-    
-    while retry_count < max_retries:
-        try:
-            mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-            # Test connection
-            mongo_client.admin.command('ping')
-            db = mongo_client[MONGO_DB]
-            collection = db[MONGO_COLLECTION]
-            logger.info("[MongoDB] Connected successfully")
-            return True
-        except Exception as e:
-            retry_count += 1
-            logger.warning(f"[MongoDB] Connection failed (attempt {retry_count}/{max_retries}): {e}")
-            if retry_count < max_retries:
-                time.sleep(5)
-    
-    logger.error("[MongoDB] Failed to connect after all retries")
-    return False
-
-def disconnect_mongodb():
-    """Safely disconnect MongoDB"""
-    global mongo_client
-    if mongo_client is not None:
-        try:
-            mongo_client.close()
-            logger.info("[MongoDB] Disconnected")
-        except:
-            pass
-        mongo_client = None
-
-# ---------- MQTT CALLBACKS ----------
-def on_mqtt_connect(client, userdata, flags, rc):
-    """Called when MQTT connects"""
-    global mqtt_connected
-    if rc == 0:
-        mqtt_connected = True
-        logger.info("[MQTT] Connected successfully (code 0)")
-        # Subscribe to both sensor and command topics
-        client.subscribe(TOPIC_SENSORS)
-        client.subscribe(TOPIC_COMMANDS)
-        logger.info(f"[MQTT] Subscribed to {TOPIC_SENSORS} and {TOPIC_COMMANDS}")
-    else:
-        mqtt_connected = False
-        logger.error(f"[MQTT] Connection failed with code {rc}")
-
-def on_mqtt_disconnect(client, userdata, rc):
-    """Called when MQTT disconnects"""
-    global mqtt_connected
-    mqtt_connected = False
-    if rc != 0:
-        logger.warning(f"[MQTT] Unexpected disconnection (code {rc}). Will attempt to reconnect...")
-    else:
-        logger.info("[MQTT] Disconnected")
-
-def on_mqtt_message(client, userdata, msg):
-    """Called when MQTT message arrives"""
+# ─────────────────────────────────────────────
+# Twilio SMS / WhatsApp
+# ─────────────────────────────────────────────
+def send_sms(to_number, message):
+    if not TWILIO_SID or not to_number:
+        return
     try:
-        topic = msg.topic
-        payload = msg.payload.decode('utf-8')
-        logger.info(f"[MQTT] Message received on {topic}: {payload[:100]}")
-        
-        if topic == TOPIC_SENSORS:
-            # Sensor data from Arduino
-            handle_sensor_data(json.loads(payload))
-        
-        elif topic == TOPIC_COMMANDS:
-            # Command from web dashboard
-            handle_dashboard_command(client, json.loads(payload))
-    
-    except json.JSONDecodeError as e:
-        logger.error(f"[MQTT] Failed to parse JSON: {e}")
+        from twilio.rest import Client
+        client = Client(TWILIO_SID, TWILIO_TOKEN)
+        client.messages.create(body=message, from_=TWILIO_FROM, to=to_number)
+        log.info(f'SMS sent to {to_number}')
     except Exception as e:
-        logger.error(f"[MQTT] Error processing message: {e}")
+        log.error(f'SMS error: {e}')
 
-def handle_sensor_data(data):
-    """Process incoming sensor data and save to MongoDB"""
-    global current_sensor_data
+def send_whatsapp(to_number, message):
+    if not TWILIO_SID or not to_number:
+        return
     try:
-        # Create a copy for in-memory storage (with ISO timestamp for JSON)
-        live_data = data.copy()
-        live_data['created_at'] = datetime.utcnow().isoformat()
-        
-        # Store in memory for /api/current endpoint (live data)
-        current_sensor_data = live_data
-        logger.info(f"[LIVE] Current sensor data updated: water_dist={live_data.get('water_dist', 'N/A')}")
-        
-        # Save to MongoDB (with datetime timestamp)
-        if collection is not None:
-            data['created_at'] = datetime.utcnow()  # Keep as datetime for MongoDB
-            result = collection.insert_one(data)
-            logger.info(f"[DB] Sensor data saved (ID: {result.inserted_id})")
+        from twilio.rest import Client
+        client = Client(TWILIO_SID, TWILIO_TOKEN)
+        client.messages.create(
+            body=message,
+            from_=f'whatsapp:{TWILIO_FROM}',
+            to=f'whatsapp:{to_number}',
+        )
+        log.info(f'WhatsApp sent to {to_number}')
+    except Exception as e:
+        log.error(f'WhatsApp error: {e}')
+
+def notify_user(farm_id, severity, title, body):
+    """Send web push and, for critical alerts, SMS/WhatsApp."""
+    send_web_push_to_farm(farm_id, title, body)
+    if severity == 'critical' and MONGO_OK:
+        user = users_col.find_one({'farm_id': farm_id})
+        if user:
+            phone    = user.get('phone', '')
+            whatsapp = user.get('whatsapp', '')
+            msg = f'{title}\n{body}'
+            if phone:
+                send_sms(phone, msg)
+            if whatsapp:
+                send_whatsapp(whatsapp, msg)
+
+# ─────────────────────────────────────────────
+# Handle incoming sensor data
+# ─────────────────────────────────────────────
+def handle_sensor(payload: dict):
+    if not MONGO_OK:
+        return
+    try:
+        payload['created_at'] = datetime.utcnow()
+        sensors_col.insert_one(payload)
+        farm_id = payload.get('farm_id', 'henhouse_1')
+        log.info(f'Sensor saved: farm={farm_id} temp={payload.get("temp")} hum={payload.get("hum")}')
+    except Exception as e:
+        log.error(f'handle_sensor error: {e}')
+
+# ─────────────────────────────────────────────
+# Handle incoming alert from Arduino
+# ─────────────────────────────────────────────
+def handle_alert(payload: dict):
+    if not MONGO_OK:
+        return
+    try:
+        farm_id    = payload.get('farm_id', 'henhouse_1')
+        alert_type = payload.get('type', '').lower()
+        value      = payload.get('value')
+        uptime     = payload.get('uptime')
+
+        if not can_alert(farm_id, alert_type):
+            log.info(f'Alert {alert_type} for {farm_id} suppressed (cooldown)')
+            return
+
+        info = ALERT_MAP.get(alert_type)
+        if not info:
+            log.warning(f'Unknown alert type: {alert_type}')
+            severity = 'warning'
+            title = f'⚠️ Alert: {alert_type}'
+            message = f'Alert received from device'
         else:
-            logger.error("[DB] Collection not available, skipping save")
-    
-    except Exception as e:
-        logger.error(f"[DB] Error saving sensor data: {e}")
+            severity, title, message = info
 
-def handle_dashboard_command(client, command):
-    """Forward dashboard command to Arduino actuators"""
+        notif = {
+            'farm_id':   farm_id,
+            'type':      alert_type,
+            'severity':  severity,
+            'title':     title,
+            'message':   message,
+            'value':     value,
+            'uptime':    uptime,
+            'timestamp': datetime.utcnow().isoformat() + 'Z',
+            'read':      False,
+            'source':    'arduino',
+        }
+        notifs_col.insert_one(notif)
+        log.info(f'Alert saved: {alert_type} farm={farm_id}')
+
+        notify_user(farm_id, severity, title, message)
+
+    except Exception as e:
+        log.error(f'handle_alert error: {e}')
+
+# ─────────────────────────────────────────────
+# MQTT
+# ─────────────────────────────────────────────
+mqtt_client = None
+
+def on_connect(client, userdata, flags, rc):
+    if rc == 0:
+        log.info('MQTT connected')
+        client.subscribe(TOPIC_SENSORS)
+        client.subscribe(TOPIC_ALERTS)
+        log.info(f'Subscribed to {TOPIC_SENSORS} and {TOPIC_ALERTS}')
+    else:
+        log.error(f'MQTT connect failed rc={rc}')
+
+def on_disconnect(client, userdata, rc):
+    log.warning(f'MQTT disconnected rc={rc}, reconnecting...')
+
+def on_message(client, userdata, msg):
+    topic = msg.topic
     try:
-        logger.info(f"[CMD] Command from dashboard: {command}")
-        
-        # Forward to Arduino actuators topic
-        payload = json.dumps(command)
-        client.publish(TOPIC_ACTUATORS, payload, qos=1)
-        logger.info(f"[MQTT] Command forwarded to {TOPIC_ACTUATORS}")
-    
+        payload = json.loads(msg.payload.decode('utf-8'))
     except Exception as e:
-        logger.error(f"[CMD] Error forwarding command: {e}")
+        log.error(f'JSON parse error on {topic}: {e}')
+        return
 
-# ---------- MQTT CONNECTION ----------
+    if topic == TOPIC_SENSORS:
+        handle_sensor(payload)
+    elif topic == TOPIC_ALERTS:
+        handle_alert(payload)
+    else:
+        log.debug(f'Unhandled topic: {topic}')
+
 def connect_mqtt():
-    """Establish MQTT connection with retry logic"""
     global mqtt_client
-    retry_count = 0
-    max_retries = 5
-    
-    while retry_count < max_retries:
-        try:
-            mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1, client_id=f"henhouse_bridge_{int(time.time())}")
-            mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
-            mqtt_client.on_connect = on_mqtt_connect
-            mqtt_client.on_disconnect = on_mqtt_disconnect
-            mqtt_client.on_message = on_mqtt_message
-            
-            # Setup TLS
-            mqtt_client.tls_set()
-            
-            # Connect
-            mqtt_client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
-            logger.info(f"[MQTT] Connection initiated to {MQTT_BROKER}:{MQTT_PORT}")
-            
-            # Start connection loop in background
-            mqtt_client.loop_start()
-            
-            # Wait for connection to establish
-            for i in range(10):
-                if mqtt_connected:
-                    return True
-                time.sleep(1)
-            
-            logger.warning("[MQTT] Connection established but callback not triggered within timeout")
-            return True
-        
-        except Exception as e:
-            retry_count += 1
-            logger.warning(f"[MQTT] Connection failed (attempt {retry_count}/{max_retries}): {e}")
-            if retry_count < max_retries:
-                time.sleep(5)
-    
-    logger.error("[MQTT] Failed to connect after all retries")
-    return False
-
-def disconnect_mqtt():
-    """Safely disconnect MQTT"""
-    global mqtt_client
-    if mqtt_client is not None:
-        try:
-            mqtt_client.loop_stop()
-            mqtt_client.disconnect()
-            logger.info("[MQTT] Disconnected")
-        except:
-            pass
-        mqtt_client = None
-
-# ---------- MQTT MONITOR THREAD ----------
-def mqtt_monitor_thread():
-    """Monitor and reconnect MQTT if needed"""
-    global mqtt_client, mqtt_connected
-    
-    while True:
-        try:
-            time.sleep(10)
-            
-            if not mqtt_connected and mqtt_client is not None:
-                logger.warning("[MQTT] Connection lost, attempting to reconnect...")
-                try:
-                    mqtt_client.reconnect()
-                except:
-                    # If reconnect fails, create new connection
-                    disconnect_mqtt()
-                    connect_mqtt()
-        
-        except Exception as e:
-            logger.error(f"[Monitor] Error in MQTT monitor: {e}")
-
-# ---------- FLASK THREAD ----------
-def run_flask():
-    """Run Flask in a separate thread"""
-    import os
-    port = int(os.environ.get('PORT', 5000))
-    logger.info(f"[Flask] Starting Flask server on http://0.0.0.0:{port}")
-    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
-
-# ---------- MAIN ----------
-def main():
-    """Main initialization and coordination"""
-    logger.info("=" * 60)
-    logger.info("HenHouse IoT Bridge Starting")
-    logger.info("=" * 60)
-    
-    # Connect to MongoDB
-    if not connect_mongodb():
-        logger.error("Failed to connect to MongoDB, continuing anyway...")
-    
-    # Connect to MQTT
-    if not connect_mqtt():
-        logger.error("Failed to connect to MQTT, continuing anyway...")
-    
-    # Start MQTT monitor thread
-    monitor_thread = threading.Thread(target=mqtt_monitor_thread, daemon=True)
-    monitor_thread.start()
-    logger.info("[Thread] MQTT monitor thread started")
-    
-    # Start Flask thread
-    flask_thread = threading.Thread(target=run_flask, daemon=False)
-    flask_thread.start()
-    logger.info("[Thread] Flask API thread started")
-    
-    # Keep main thread alive
     try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        logger.info("Shutting down...")
-        disconnect_mqtt()
-        disconnect_mongodb()
-        logger.info("Bridge stopped")
+        c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1, client_id='henhouse_bridge')
+        c.username_pw_set(MQTT_USER, MQTT_PASS)
+        c.on_connect    = on_connect
+        c.on_disconnect = on_disconnect
+        c.on_message    = on_message
+        c.tls_set()
+        c.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
+        c.loop_start()
+        mqtt_client = c
+        log.info('MQTT client started')
+    except Exception as e:
+        log.error(f'MQTT init failed: {e}')
+
+connect_mqtt()
+
+# ─────────────────────────────────────────────
+# Keep-alive ping for Render free tier
+# ─────────────────────────────────────────────
+def keep_alive():
+    while True:
+        time.sleep(840)
+        url = os.getenv('RENDER_EXTERNAL_URL', FLASK_URL)
+        if url:
+            try:
+                requests.get(f'{url}/ping', timeout=10)
+                log.info('Keep-alive ping sent')
+            except Exception:
+                pass
+
+threading.Thread(target=keep_alive, daemon=True).start()
+
+# ─────────────────────────────────────────────
+# Auto-reconnect watchdog
+# ─────────────────────────────────────────────
+def watchdog():
+    while True:
+        time.sleep(60)
+        if not MONGO_OK:
+            log.warning('MongoDB offline, attempting reconnect...')
+            connect_mongo()
+        if mqtt_client and not mqtt_client.is_connected():
+            log.warning('MQTT offline, attempting reconnect...')
+            try:
+                mqtt_client.reconnect()
+            except Exception:
+                connect_mqtt()
+
+threading.Thread(target=watchdog, daemon=True).start()
+
+# ─────────────────────────────────────────────
+# Minimal Flask API (fallback for old HTML dashboard)
+# ─────────────────────────────────────────────
+from flask import Flask, jsonify, request as flask_request
+from flask_cors import CORS
+
+app = Flask(__name__)
+CORS(app, origins='*')
+
+@app.route('/ping')
+def ping():
+    return jsonify({'ok': True})
+
+@app.route('/api/current')
+def api_current():
+    if not MONGO_OK:
+        return jsonify({'error': 'DB unavailable'}), 503
+    farm_id = flask_request.args.get('farm_id', 'henhouse_1')
+    doc = sensors_col.find_one(
+        {'$or': [{'farm_id': farm_id}, {'device_id': farm_id}]},
+        sort=[('_id', DESCENDING)]
+    )
+    if not doc:
+        return jsonify({'error': 'No data'}), 404
+    doc['_id'] = str(doc['_id'])
+    if 'created_at' in doc:
+        doc['created_at'] = doc['created_at'].isoformat() if hasattr(doc['created_at'], 'isoformat') else str(doc['created_at'])
+    return jsonify(doc)
+
+@app.route('/api/history')
+def api_history():
+    if not MONGO_OK:
+        return jsonify({'error': 'DB unavailable'}), 503
+    farm_id = flask_request.args.get('farm_id', 'henhouse_1')
+    limit   = min(int(flask_request.args.get('limit', 20)), 100)
+    docs = list(sensors_col.find(
+        {'$or': [{'farm_id': farm_id}, {'device_id': farm_id}]},
+        sort=[('_id', DESCENDING)]
+    ).limit(limit))
+    for d in docs:
+        d['_id'] = str(d['_id'])
+        if 'created_at' in d:
+            d['created_at'] = d['created_at'].isoformat() if hasattr(d['created_at'], 'isoformat') else str(d['created_at'])
+    return jsonify(docs)
 
 if __name__ == '__main__':
-    main()
+    port = int(os.getenv('PORT', 5001))
+    log.info(f'Bridge API running on port {port}')
+    app.run(host='0.0.0.0', port=port)
